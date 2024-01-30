@@ -1,5 +1,11 @@
 <?php
 
+/*
+* This is a simple API for storing and retrieving data from a filesystem
+* It is designed to be used with the Articulate Rise and Articulate Storyline 360 authoring tools
+* See also https://github.com/frumbert/local_blobstorebackend for a Moodle-specific plugin which performs roughly the same function
+*/
+
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Headers: Authorization, Content-Type, Cache-Control, X-Requested-With");
 header("Access-Control-Allow-Methods: GET, PUT, OPTIONS, HEAD");
@@ -10,6 +16,7 @@ require_once("../vendor/autoload.php");
 
 use Dompdf\Dompdf;
 
+// helper methods for combining data from PHP's various input streams
 function get_request_data () {
   return array_merge(empty($_POST) ? array() : $_POST, (array) json_decode(file_get_contents('php://input'), true), $_GET);
 }
@@ -19,6 +26,8 @@ function get_method () {
 function get_dataurl () {
   return $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'] . '/data/';
 }
+
+// generic output method
 function send_response ($response, $code = 200) {
   header("Content-Type: application/json");
   http_response_code($code);
@@ -28,9 +37,11 @@ function send_response ($response, $code = 200) {
   die(json_encode($response));
 }
 
+// recurse through the filesystem to find all files for matching users
+// the file system structure is /data/{context}/{block}/{user}/db.json
+// so this will get inefficient if there are a lot of users; a db would be better
 function CollateResponses($user,$context,$kind = "question") {
   $ordered = [];
-  // recurse through the filesystem to find all files for matching users
   $db = "./data/{$context}";
   $blocks = array_diff(scandir($db), array('..', '.'));
   $pages = [];
@@ -58,6 +69,12 @@ function CollateResponses($user,$context,$kind = "question") {
   return $ordered;
 }
 
+// a quick and dirty PDF exporter
+// uses the excellent DomPDF library, and Parsedown for markdown parsing
+// supports CSS2, images, html5, etc
+// loads a template, and replaces the {{title}} and {{notes}} placeholders
+// then renders the PDF and saves it to the filesystem
+// a fetch/pickup javascript can then force a download to the client browser
 class pdfExporter {
   protected $user;
   protected $context;
@@ -107,6 +124,7 @@ class pdfExporter {
   }
 }
 
+// a simple cleanup function to remove old files
 function CleanDownloads() {
   $x = 1 * 60 * 60; // 1 hour
   $current_time = time();
@@ -121,6 +139,7 @@ function CleanDownloads() {
   }
 }
 
+// main code
 $headers = getallheaders();
 $method = get_method();
 $data = get_request_data();
@@ -146,21 +165,28 @@ if (!in_array($headers['Authorization'], $authhosts)) {
 $url = $data['url'] ?? null;
 list($digest,$context,$block) = explode('/', $url);
 
+// the kind of data we want to return (to support multiple interaction types)
 $kind = $data['kind'] ?? 'question';
 
+// early exit if the request is malformed
 if (empty($digest) || empty($context) || empty($block)) {
   send_response(array('error' => 'Malformed request', 'data' => $data), 400);
 }
 
+// this is the main content structure we need for each peice of data
 $db = "./data/{$context}/{$block}/{$digest}";
 
+// in Articulate, the digest is a base64 encoded string of the user's email address and user name (comes from SCORM data provided by the LMS)
+// we use base64 url encoding, where you replace +/= with _-. so it is URL compatible (google it)
 // $user = base64_decode(strtr($digest, '._-', '+/='));
-// PROD - salt the earth to ensure abstraction in case of disk compromise
+
+
+// PROD RECCOMENDATION - salt the earth to ensure abstraction in case of disk compromise
 // $digest = sha1($digest.$salt);
 // $context = sha1($context.$salt);
 
 switch ($method) {
-  case "DELETE":
+  case "DELETE": // globiterator can handle wildcard searching
     $it = new GlobIterator("./data/{$context}/*/{$digest}/*", FilesystemIterator::KEY_AS_PATHNAME | FilesystemIterator::CURRENT_AS_FILEINFO);
     while($it->valid()){
         $contents = json_decode(file_get_contents($it->current()->getRealPath()));
@@ -171,7 +197,7 @@ switch ($method) {
     }
     break;
 
-  case "_DELETE":
+  case "_DELETE": // alternate method, deprecated
     $db = "./data/";
     $files = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($db, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -194,11 +220,11 @@ switch ($method) {
 
   case "GET":
     switch ($block) {
-      case "cleanup":
+      case "cleanup": // called after fetch calls the download method
         CleanDownloads();
       break;
 
-      case "download":
+      case "download": // generate the pdf of the content for this context, then offer the pickup url
         $pdf = new pdfExporter($digest,$context,$kind);
         $courseName = $pdf->GetCourseName();
         $filename = md5($courseName.time().$salt);
@@ -209,12 +235,12 @@ switch ($method) {
         send_response($result);
       break;
 
-      case "collate":
+      case "collate": // generate a collated list of all the data for this user
           $results = CollateResponses($key,$course,$kind);
           send_response(['success' => true, 'records' => $results]);
       break;
 
-      default:
+      default: // just look up the data for this context and return it (or 404 if not yet set)
         if (!file_exists("{$db}/db.json")) {
           send_response(array('success' => false), 404);
         }
@@ -223,7 +249,7 @@ switch ($method) {
     }
   break;
 
-  case "PUT":
+  case "PUT": // store the data for this context (no validation, just raw storage)
     if (!file_exists($db)) {
       mkdir($db, 0775, true);
     }
@@ -237,7 +263,7 @@ switch ($method) {
     ));
   break;
 
-  default:
+  default: // we don't support any other methods or display anything to browsers
     send_response(array('error' => 'Bad method'), 405);
 
 }
